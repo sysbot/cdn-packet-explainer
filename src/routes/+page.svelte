@@ -1,610 +1,538 @@
-<script lang="ts">
-	import {
-		tokens,
-		expandedBlock,
-		vectorHeight,
-		inputText,
-		rootRem,
-		sampling,
-		maxVectorHeight,
-		minVectorHeight,
-		maxVectorScale,
-		headContentHeight,
-		temperature,
-		modelData,
-		modelSession,
-		isFetchingModel,
-		selectedExampleIdx,
-		isMobile,
-		isOnBlockTransition,
-		blockIdx,
-		isTextbookOpen,
-		userId
-	} from '~/store';
-	import { PreTrainedTokenizer } from '@xenova/transformers';
-	import Sankey from '~/components/Sankey.svelte';
-	import Attention from '~/components/Attention.svelte';
-	import SubsequentBlocks from '~/components/SubsequentBlocks.svelte';
-	import LinearSoftmax from '~/components/LinearSoftmax.svelte';
-	import Embedding from '~/components/Embedding.svelte';
-	import Mlp from '~/components/Mlp.svelte';
-
+<script>
 	import { onMount } from 'svelte';
-	import classNames from 'classnames';
-	import { base } from '$app/paths';
-	import * as ort from 'onnxruntime-web';
+	import {
+		ANYCAST_GATEWAY,
+		POP_PREFIX,
+		VIP,
+		buildControlPlaneSteps,
+		buildPacketSteps,
+		flows,
+		hosts,
+		topologyLinks,
+		topologyNodes
+	} from '$lib/scenario.js';
 
-	import { adjustTemperature, runModel, fakeRunWithCachedData } from '~/utils/data';
-	import { fetchAndMergeChunks } from '~/utils/fetchChunks';
-	import WeightPopovers from '~/components/WeightPopovers.svelte';
-	import { fade } from 'svelte/transition';
-	import { AutoTokenizer } from '@xenova/transformers';
-	import { ex0, ex1, ex2, ex3, ex4 } from '~/constants/examples';
-	import BlockTransition from '~/components/BlockTransition.svelte';
-	import QKV from '~/components/QKV.svelte';
-	import Textbook from '~/components/textbook/Textbook.svelte';
+	let mode = 'packet';
+	let stepIndex = 0;
+	let flowId = flows[0].id;
+	let unavailableHostIds = [];
+	let playing = false;
+	let playbackTimer;
 
-	ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.23.0/dist/';
-	ort.env.logLevel = 'error';
+	$: flow = flows.find((candidate) => candidate.id === flowId) || flows[0];
+	$: packetScenario = buildPacketSteps(flow, unavailableHostIds);
+	$: steps = mode === 'packet' ? packetScenario.steps : buildControlPlaneSteps(unavailableHostIds);
+	$: if (stepIndex >= steps.length) stepIndex = steps.length - 1;
+	$: currentStep = steps[stepIndex];
+	$: activeNodes = new Set(currentStep.activeNodes || []);
+	$: activeLinks = new Set(currentStep.activeLinks || []);
+	$: selectedHost = packetScenario.selected;
+	$: ingressLeaf = packetScenario.ingress;
+	$: healthyCount = hosts.length - unavailableHostIds.length;
 
-	let active = false;
-	let appStartTime = Date.now();
+	const nodeMap = new Map(topologyNodes.map((node) => [node.id, node]));
 
-	// fetch model
-	onMount(async () => {
-		const gpt2Tokenizer = await AutoTokenizer.from_pretrained('Xenova/gpt2');
-		active = true;
-
-		const unsubscribe = subscribeInputs(gpt2Tokenizer);
-
-		if (!$isMobile) {
-			await fetchModel();
-		}
-
-		return unsubscribe;
-	});
-
-	// Fetch model onnx
-	const fetchModel = async () => {
-		const chunkNum = 63; //TODO: move to model meta
-		const chunkUrls = Array(chunkNum)
-			.fill(0)
-			.map((d, i) => `${base}/model-v2/gpt2.onnx.part${i}`);
-
-		// Fetch from cache
-		const { hasCache, mergedArray } = await fetchAndMergeChunks(chunkUrls);
-
-		// Create a Blob from the merged array
-		const blob = new Blob([mergedArray], { type: 'application/octet-stream' });
-
-		// Create a URL for the Blob
-		const url = URL.createObjectURL(blob);
-
-		// Create ONNX session using the Blob URL
-		const session = await ort.InferenceSession.create(url, {
-			// logSeverityLevel: 0
-		});
-
-		modelSession.set(session);
-
-		isFetchingModel.set(false);
-
-		const loadTime = Date.now() - appStartTime;
-		window.dataLayer?.push({
-			event: `model-loaded`,
-			use_cache: hasCache,
-			load_time_ms: loadTime,
-			user_id: $userId
-		});
-	};
-
-	// Subscribe inputs
-	const cachedDataMap = [ex0, ex1, ex2, ex3, ex4];
-	const subscribeInputs = (tokenizer: PreTrainedTokenizer) => {
-		const runModelOrCache = () => {
-			if ($isFetchingModel || !$modelSession) {
-				const cachedData = cachedDataMap[$selectedExampleIdx];
-
-				fakeRunWithCachedData({
-					cachedData,
-					tokenizer,
-					temperature: $temperature,
-					sampling: $sampling
-				});
-				return;
-			}
-			// run model when input has changed
-			runModel({
-				tokenizer,
-				input: $inputText.trim(),
-				temperature: $temperature,
-				sampling: $sampling
-			});
-		};
-
-		const unsubscribeInputText = inputText.subscribe((value) => {
-			runModelOrCache();
-		});
-
-		let initialTemperature = true; // prevent initial redundant rendering
-		const unsubscribeTemperature = temperature.subscribe((value) => {
-			if (initialTemperature) {
-				initialTemperature = false;
-				return;
-			}
-			adjustTemperature({
-				tokenizer,
-				logits: $modelData.logits,
-				temperature: value,
-				sampling: $sampling
-			});
-		});
-
-		let initialSampling = true; // prevent initial redundant rendering
-		const unsubscribeSmapling = sampling.subscribe((value) => {
-			if (initialSampling) {
-				initialSampling = false;
-				return;
-			}
-			adjustTemperature({
-				tokenizer,
-				logits: $modelData.logits,
-				temperature: $temperature,
-				sampling: value
-			});
-		});
-
-		return () => {
-			unsubscribeInputText();
-			unsubscribeTemperature();
-			unsubscribeSmapling();
-		};
-	};
-
-	// visual elements
-	let vizHeight = 0;
-	let titleHeight = rootRem * 5;
-
-	const calculateVectorHeight = () => {
-		const gaps = rootRem * 0.5 * ($tokens.length - 1);
-		const vectorHeightVal = Math.min(
-			Math.max((vizHeight - titleHeight - gaps) / $tokens.length / maxVectorScale, minVectorHeight),
-			maxVectorHeight
-		);
-		vectorHeight.set(vectorHeightVal);
-		headContentHeight.set(Math.max($tokens.length * vectorHeightVal * 3 + gaps, rootRem * 20));
-	};
-
-	$: if (vizHeight || $tokens.length) {
-		calculateVectorHeight();
+	function setMode(nextMode) {
+		mode = nextMode;
+		stepIndex = 0;
+		stopPlayback();
 	}
+
+	function moveStep(delta) {
+		stepIndex = Math.max(0, Math.min(steps.length - 1, stepIndex + delta));
+	}
+
+	function togglePlayback() {
+		if (playing) {
+			stopPlayback();
+			return;
+		}
+		playing = true;
+		playbackTimer = window.setInterval(() => {
+			if (stepIndex >= steps.length - 1) {
+				stopPlayback();
+				return;
+			}
+			stepIndex += 1;
+		}, 1800);
+	}
+
+	function stopPlayback() {
+		playing = false;
+		if (playbackTimer) window.clearInterval(playbackTimer);
+		playbackTimer = undefined;
+	}
+
+	function toggleHost(hostId) {
+		unavailableHostIds = unavailableHostIds.includes(hostId)
+			? unavailableHostIds.filter((id) => id !== hostId)
+			: [...unavailableHostIds, hostId];
+		stopPlayback();
+	}
+
+	function resetFailures() {
+		unavailableHostIds = [];
+	}
+
+	function linkPath(link) {
+		const from = nodeMap.get(link.from);
+		const to = nodeMap.get(link.to);
+		if (!from || !to) return '';
+		if (link.control) {
+			const controlY = Math.max(from.y, to.y) + 42;
+			return `M ${from.x + 58} ${from.y + 24} C ${from.x + 58} ${controlY}, ${to.x + 58} ${controlY}, ${to.x + 58} ${to.y + 24}`;
+		}
+		return `M ${from.x + 58} ${from.y + 24} L ${to.x + 58} ${to.y + 24}`;
+	}
+
+	function midpoint(link) {
+		const from = nodeMap.get(link.from);
+		const to = nodeMap.get(link.to);
+		return {
+			x: ((from?.x || 0) + (to?.x || 0)) / 2 + 58,
+			y: ((from?.y || 0) + (to?.y || 0)) / 2 + (link.control ? 48 : 10)
+		};
+	}
+
+	function stateLabel(host, unavailableIds, selected) {
+		if (unavailableIds.includes(host.id)) return 'WITHDRAWN';
+		if (selected?.id === host.id) return 'HASH WINNER';
+		return 'ECMP READY';
+	}
+
+	onMount(() => {
+		const handleKey = (event) => {
+			if (
+				event.target instanceof Element &&
+				event.target.closest('a, button, input, select, textarea, [contenteditable="true"]')
+			)
+				return;
+			if (event.key === 'ArrowRight') moveStep(1);
+			if (event.key === 'ArrowLeft') moveStep(-1);
+			if (event.key === ' ') {
+				event.preventDefault();
+				togglePlayback();
+			}
+		};
+		window.addEventListener('keydown', handleKey);
+		return () => {
+			window.removeEventListener('keydown', handleKey);
+			stopPlayback();
+		};
+	});
 </script>
 
-<div
-	class:active
-	class="main-section h-full w-full"
-	style={`--vector-height: ${$vectorHeight}px;--title-height: ${titleHeight}px;--content-height:${vizHeight - titleHeight}px;`}
->
-	{#if !!$expandedBlock.id}
-		<div
-			class={classNames('dim', `${$expandedBlock.id || ''}`)}
-			transition:fade={{ duration: 100 }}
-		></div>
-		<div
-			class={classNames('dim-partial left', `${$expandedBlock.id || ''}`)}
-			transition:fade={{ duration: 100 }}
-		></div>
-		<div
-			class={classNames('dim-partial right', `${$expandedBlock.id || ''}`)}
-			transition:fade={{ duration: 100 }}
-		></div>
-	{/if}
-	<div class="sankey opacity-1" class:attention={$expandedBlock.id === 'attention'}>
-		<Sankey />
-	</div>
-	<div class="nodes resize-watch">
-		<div class="steps" class:expanded={!!$expandedBlock.id} bind:offsetHeight={vizHeight}>
-			<Embedding className="step" />
-			<div class="blocks relative">
-				<div class="block-steps main" class:initial={$blockIdx === 0}>
-					<QKV className="step" />
-					<Attention className="step" />
-					<Mlp className="step" />
-				</div>
-				<div
-					class="block-steps next"
-					class:hide={!$isOnBlockTransition}
-					class:initial={$blockIdx === 0}
-				>
-					<QKV className="step" />
-					<Attention className="step" />
-					<Mlp className="step" />
-				</div>
-				<div class="transition-watch" class:hide={!$isOnBlockTransition}></div>
+<svelte:head>
+	<title>Packet Path Explainer | BGP, MPLS, and CDN Host Load Balancing</title>
+	<meta
+		name="description"
+		content="Step through BGP control-plane convergence and packet forwarding in an MPLS-backed CDN point of presence."
+	/>
+</svelte:head>
+
+<div class="app-shell">
+	<header class="topbar">
+		<div class="brand-lockup">
+			<div class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></div>
+			<div>
+				<p class="eyebrow">NETWORK SYSTEMS LAB</p>
+				<h1>Packet Path Explainer</h1>
 			</div>
-			<SubsequentBlocks className="step" />
-			<LinearSoftmax className="step" />
 		</div>
-		<WeightPopovers />
-		<BlockTransition />
-		{#if !$isMobile}
-			<Textbook showTextCard={$isTextbookOpen} />
+		<div class="topbar-status">
+			<span class="status-dot"></span>
+			<span>{healthyCount}/3 CACHE NODES ADVERTISING</span>
+			<a href="https://github.com/sysbot/cdn-packet-explainer" target="_blank" rel="noreferrer"
+				>SOURCE ↗</a
+			>
+		</div>
+	</header>
+
+	<main>
+		<section class="hero-panel">
+			<div class="hero-copy">
+				<p class="kicker">CDN POP REFERENCE PATH / AS 65000</p>
+				<h2>One MAC at transit.<br /><em>Many routed hosts behind it.</em></h2>
+				<p class="hero-description">
+					Follow a packet as BGP chooses the POP, EVPN-MPLS carries the transit Layer 2 service, and
+					a service leaf resolves one VIP into a resilient ECMP pool of host adjacencies.
+				</p>
+			</div>
+			<div class="identity-card">
+				<div>
+					<span>PUBLIC ROUTE</span>
+					<strong>{POP_PREFIX}</strong>
+				</div>
+				<div>
+					<span>SERVICE VIP</span>
+					<strong>{VIP}</strong>
+				</div>
+				<div>
+					<span>TRANSIT-FACING MAC</span>
+					<strong>{ANYCAST_GATEWAY.mac}</strong>
+				</div>
+			</div>
+		</section>
+
+		<section class="control-rail" aria-label="Explainer controls">
+			<div class="mode-tabs" role="group" aria-label="Explanation mode">
+				<button
+					class:active={mode === 'packet'}
+					on:click={() => setMode('packet')}
+					aria-pressed={mode === 'packet'}
+				>
+					<span>01</span> PACKET WALK
+				</button>
+				<button
+					class:active={mode === 'control'}
+					on:click={() => setMode('control')}
+					aria-pressed={mode === 'control'}
+				>
+					<span>02</span> CONTROL PLANE
+				</button>
+			</div>
+
+			<label class="flow-select">
+				<span>FLOW PROFILE</span>
+				<select bind:value={flowId} disabled={mode === 'control'} on:change={() => (stepIndex = 0)}>
+					{#each flows as item}
+						<option value={item.id}>{item.label} · {item.protocol}</option>
+					{/each}
+				</select>
+			</label>
+
+			<div class="transport-legend" aria-label="Layer legend">
+				<span><i class="l2"></i>L2</span>
+				<span><i class="l3"></i>L3/BGP</span>
+				<span><i class="mpls"></i>MPLS</span>
+				<span><i class="control"></i>CONTROL</span>
+			</div>
+		</section>
+
+		<section class="topology-panel">
+			<div class="panel-heading">
+				<div>
+					<p class="eyebrow">LIVE TOPOLOGY</p>
+					<h3>{mode === 'packet' ? 'Forwarding path' : 'Route propagation'}</h3>
+				</div>
+				<div class="step-counter">
+					STEP {String(stepIndex + 1).padStart(2, '0')} / {String(steps.length).padStart(2, '0')}
+				</div>
+			</div>
+
+			<div class="topology-scroll">
+				<svg
+					class="topology"
+					viewBox="0 0 1160 435"
+					role="img"
+					aria-label="CDN point of presence network topology"
+				>
+					<defs>
+						<pattern id="grid" width="24" height="24" patternUnits="userSpaceOnUse">
+							<path
+								d="M 24 0 L 0 0 0 24"
+								fill="none"
+								stroke="rgba(148,163,184,.08)"
+								stroke-width="1"
+							/>
+						</pattern>
+						<filter id="glow">
+							<feGaussianBlur stdDeviation="3" result="blur" />
+							<feMerge><feMergeNode in="blur" /><feMergeNode in="SourceGraphic" /></feMerge>
+						</filter>
+					</defs>
+					<rect width="1160" height="435" fill="url(#grid)" />
+
+					{#each topologyLinks as link}
+						<g
+							class:active={activeLinks.has(link.id)}
+							class:control-link={link.control}
+							class="link-group"
+						>
+							<path class="link-back" d={linkPath(link)} />
+							<path class="link-front" d={linkPath(link)} />
+							<text x={midpoint(link).x} y={midpoint(link).y}>{link.label}</text>
+						</g>
+					{/each}
+
+					{#each topologyNodes as node}
+						<g
+							class="node-group {node.kind}"
+							class:active={activeNodes.has(node.id)}
+							class:failed={unavailableHostIds.includes(node.id)}
+							transform={`translate(${node.x}, ${node.y})`}
+						>
+							<rect width="116" height="48" rx="8" />
+							<circle cx="14" cy="14" r="4" />
+							<text class="node-label" x="58" y="21" text-anchor="middle">{node.label}</text>
+							<text class="node-sublabel" x="58" y="37" text-anchor="middle">{node.sublabel}</text>
+							{#if unavailableHostIds.includes(node.id)}
+								<path class="failure-mark" d="M 8 7 L 108 41 M 108 7 L 8 41" />
+							{/if}
+						</g>
+					{/each}
+				</svg>
+			</div>
+
+			<div class="step-strip">
+				{#each steps as step, index}
+					<button
+						class:active={index === stepIndex}
+						class:complete={index < stepIndex}
+						on:click={() => {
+							stepIndex = index;
+							stopPlayback();
+						}}
+						aria-label={`Go to step ${index + 1}: ${step.title}`}
+					>
+						<span>{String(index + 1).padStart(2, '0')}</span>
+					</button>
+				{/each}
+			</div>
+		</section>
+
+		<section class="explanation-grid">
+			<article class="step-card">
+				<div class="step-meta">
+					<span>{currentStep.phase}</span>
+					<span>{currentStep.layer}</span>
+				</div>
+				<h3>{currentStep.title}</h3>
+				<p class="step-summary">{currentStep.summary}</p>
+				<p class="step-detail">{currentStep.detail}</p>
+				<div class="lookup-list">
+					{#each currentStep.lookup || [] as item, index}
+						<div><span>{index + 1}</span><code>{item}</code></div>
+					{/each}
+				</div>
+				<div class="playback-controls">
+					<button on:click={() => moveStep(-1)} disabled={stepIndex === 0}>← PREV</button>
+					<button class="play" on:click={togglePlayback}>{playing ? 'PAUSE' : 'AUTO PLAY'}</button>
+					<button on:click={() => moveStep(1)} disabled={stepIndex === steps.length - 1}
+						>NEXT →</button
+					>
+				</div>
+				<p class="keyboard-hint">Keyboard: ← → step · space play/pause</p>
+			</article>
+
+			{#if mode === 'packet'}
+				<article class="packet-card">
+					<div class="panel-heading compact">
+						<div>
+							<p class="eyebrow">PACKET INSPECTOR</p>
+							<h3>Headers at this hop</h3>
+						</div>
+						<span class="packet-live"><i></i> IN FLIGHT</span>
+					</div>
+
+					<div class="packet-stack">
+						<div class="header-layer ethernet">
+							<span>ETHERNET</span>
+							<dl>
+								<div>
+									<dt>SRC</dt>
+									<dd>{currentStep.packet.ethernet.source}</dd>
+								</div>
+								<div>
+									<dt>DST</dt>
+									<dd>{currentStep.packet.ethernet.destination}</dd>
+								</div>
+								<div>
+									<dt>VLAN</dt>
+									<dd>{currentStep.packet.ethernet.vlan}</dd>
+								</div>
+							</dl>
+						</div>
+
+						{#if currentStep.packet.mpls?.length}
+							{#each currentStep.packet.mpls as label}
+								<div class="header-layer mpls-layer">
+									<span>MPLS · {label.role}</span>
+									<dl>
+										<div>
+											<dt>LABEL</dt>
+											<dd>{label.label}</dd>
+										</div>
+										<div>
+											<dt>TTL</dt>
+											<dd>{label.ttl}</dd>
+										</div>
+									</dl>
+								</div>
+							{/each}
+						{/if}
+
+						<div class="header-layer ip-layer">
+							<span>IP</span>
+							<dl>
+								<div>
+									<dt>SRC</dt>
+									<dd>{currentStep.packet.ip.source}</dd>
+								</div>
+								<div>
+									<dt>DST</dt>
+									<dd>{currentStep.packet.ip.destination}</dd>
+								</div>
+								<div>
+									<dt>TTL</dt>
+									<dd>{currentStep.packet.ip.ttl}</dd>
+								</div>
+							</dl>
+						</div>
+
+						<div class="header-layer transport-layer">
+							<span>{currentStep.packet.transport.protocol}</span>
+							<dl>
+								<div>
+									<dt>PORTS</dt>
+									<dd>{currentStep.packet.transport.ports}</dd>
+								</div>
+							</dl>
+						</div>
+					</div>
+				</article>
+			{:else}
+				<article class="concept-card">
+					<p class="eyebrow">PLANE OWNERSHIP</p>
+					<h3>What each protocol owns</h3>
+					<div class="ownership-row">
+						<span>BGP</span>
+						<p>Which prefixes and host next hops are eligible.</p>
+					</div>
+					<div class="ownership-row">
+						<span>EVPN</span>
+						<p>Where MAC/IP identities and Layer 2 services live.</p>
+					</div>
+					<div class="ownership-row">
+						<span>MPLS</span>
+						<p>How the frame reaches an ingress leaf or a selected remote-host adjacency.</p>
+					</div>
+					<div class="ownership-row">
+						<span>ECMP</span>
+						<p>Which healthy host receives this exact flow.</p>
+					</div>
+					<div class="rule-box">
+						MPLS does not pick the cache host. BGP supplies the set; the leaf ASIC hashes the flow.
+					</div>
+				</article>
+			{/if}
+
+			<aside class="failure-card">
+				<div class="panel-heading compact">
+					<div>
+						<p class="eyebrow">FAILURE LAB</p>
+						<h3>Withdraw a host</h3>
+					</div>
+					<button
+						class="reset-button"
+						on:click={resetFailures}
+						disabled={!unavailableHostIds.length}>RESET</button
+					>
+				</div>
+				<p class="failure-intro">
+					Toggle a cache to withdraw its BGP path. The transit MAC and public aggregate remain
+					unchanged while at least one host is healthy.
+				</p>
+				<div class="host-switches">
+					{#each hosts as host}
+						<button
+							class:down={unavailableHostIds.includes(host.id)}
+							class:selected={selectedHost?.id === host.id && !unavailableHostIds.includes(host.id)}
+							on:click={() => toggleHost(host.id)}
+						>
+							<span class="host-dot" style={`--host-color:${host.color}`}></span>
+							<span><strong>{host.name}</strong><small>{host.nextHop} · AS {host.asn}</small></span>
+							<em>{stateLabel(host, unavailableHostIds, selectedHost)}</em>
+						</button>
+					{/each}
+				</div>
+				<div class="pool-result" class:empty={!selectedHost}>
+					<span>CURRENT FLOW</span>
+					<strong
+						>{selectedHost
+							? `${flow.label} → ${ingressLeaf.name} → ${selectedHost.name}`
+							: 'NO HEALTHY NEXT HOP'}</strong
+					>
+					<small
+						>{selectedHost
+							? 'Rendezvous hash remains stable until membership changes.'
+							: 'The packet is dropped and aggregate health policy should react.'}</small
+					>
+				</div>
+			</aside>
+		</section>
+
+		{#if currentStep.routes?.length}
+			<section class="route-panel">
+				<div class="panel-heading">
+					<div>
+						<p class="eyebrow">ROUTING INFORMATION BASE</p>
+						<h3>Routes relevant to this step</h3>
+					</div>
+					<span class="route-count"
+						>{currentStep.routes.length} PATH{currentStep.routes.length === 1 ? '' : 'S'}</span
+					>
+				</div>
+				<div class="route-table-wrap">
+					<table>
+						<thead
+							><tr
+								><th>Prefix</th><th>AS path</th><th>Next hop</th><th>Resolution</th><th>State</th
+								></tr
+							></thead
+						>
+						<tbody>
+							{#each currentStep.routes as route}
+								<tr class:selected={route.selected} class:withdrawn={route.state === 'withdrawn'}>
+									<td>{route.prefix}</td>
+									<td>{route.path}</td>
+									<td>{route.nextHop}</td>
+									<td
+										>{hosts.find((host) => host.nextHop === route.nextHop)?.mac ||
+											ANYCAST_GATEWAY.mac}</td
+									>
+									<td
+										><span class="route-state">{route.selected ? 'HASH WINNER' : route.state}</span
+										></td
+									>
+								</tr>
+							{/each}
+						</tbody>
+					</table>
+				</div>
+			</section>
 		{/if}
-	</div>
+
+		<section class="mental-model">
+			<div>
+				<p class="eyebrow">THE MENTAL MODEL</p>
+				<h3>Stable edge, dynamic interior</h3>
+			</div>
+			<div class="model-equation">
+				<span>ONE PUBLIC PREFIX</span><b>+</b><span>ONE TRANSIT MAC</span><b>+</b><span
+					>MANY BGP /32 PATHS</span
+				><b>→</b><strong>RESILIENT HOST POOL</strong>
+			</div>
+			<p>
+				The design keeps external routing and ARP stable while BGP changes the backend membership.
+				EVPN-MPLS extends the handoff to an independently selected ingress leaf; recursive
+				resolution turns host next-hop IPs into local or remote adjacencies; leaf ECMP maps each
+				flow to one healthy cache.
+			</p>
+		</section>
+	</main>
+
+	<footer>
+		<p>
+			Vendor-neutral reference architecture. Exact EVPN route types, labels, and health policy vary
+			by implementation.
+		</p>
+		<p>
+			Forked from the progressive-disclosure interaction model of <a
+				href="https://github.com/poloclub/transformer-explainer"
+				target="_blank"
+				rel="noreferrer">Transformer Explainer</a
+			>.
+		</p>
+	</footer>
 </div>
-
-<style lang="scss">
-	.main-section {
-		opacity: 0;
-		&.active {
-			opacity: 1;
-		}
-	}
-	.nodes {
-		height: 100%;
-		width: 100%;
-		padding: 1rem 0 3rem 0;
-		position: relative;
-	}
-	.steps {
-		position: relative;
-		width: 100%;
-		height: 100%;
-		position: relative;
-		display: grid;
-		grid-template-columns: auto 3.5fr 0.5fr 0.5fr;
-
-		&.expanded {
-			:global(.step > .title) {
-				padding-bottom: 3rem;
-			}
-		}
-
-		.blocks {
-			position: relative;
-			width: 100%;
-			height: 100%;
-
-			.block-steps {
-				height: 100%;
-				width: 100%;
-				position: absolute;
-				display: grid;
-				grid-template-columns: 0.5fr 2fr 1fr;
-			}
-			.block-steps.main {
-				transform-origin: 3rem center;
-				top: 0;
-				left: 0;
-			}
-			.block-steps.next {
-				transform-origin: right center;
-				justify-content: end;
-				top: 0;
-				right: 0;
-				pointer-events: none;
-			}
-
-			.transition-watch {
-				position: absolute;
-				top: 0;
-				left: 0;
-				height: 100%;
-				width: 100%;
-				pointer-events: none;
-			}
-
-			.hide {
-				display: none;
-			}
-			&.animate-forward {
-				.block-steps,
-				.transition-watch {
-					animation-duration: 800ms;
-					animation-timing-function: ease-in;
-				}
-				.block-steps.main {
-					animation-name: collapse;
-					&.initial {
-						transform-origin: left center;
-					}
-				}
-				.block-steps.next {
-					animation-name: expand;
-				}
-				.transition-watch {
-					animation-name: width-collapse;
-				}
-			}
-
-			&.animate-backward {
-				.block-steps,
-				.transition-watch {
-					animation-duration: 800ms;
-					animation-timing-function: ease-in;
-				}
-				.block-steps.main {
-					animation-name: expand;
-					&.initial {
-						transform-origin: left center;
-					}
-				}
-				.block-steps.next {
-					animation-name: collapse;
-				}
-				.transition-watch {
-					animation-name: width-collapse;
-				}
-			}
-		}
-	}
-	@keyframes width-collapse {
-		0% {
-			width: 100%;
-		}
-		100% {
-			width: 0%;
-		}
-	}
-	@keyframes expand {
-		0% {
-			transform: scaleX(0);
-		}
-		100% {
-			transform: scaleX(1);
-		}
-	}
-	@keyframes collapse {
-		0% {
-			transform: scaleX(1);
-		}
-		100% {
-			transform: scaleX(0);
-		}
-	}
-
-	:global(.step) {
-		height: 100%;
-		display: grid;
-		grid-template-rows: var(--title-height) 1fr;
-	}
-
-	:global(.step > .title) {
-		z-index: $COLUMN_TITLE_INDEX;
-		display: flex;
-		flex-direction: column;
-		justify-content: end;
-		grid-row: 1;
-		color: theme('colors.gray.400');
-		white-space: nowrap;
-		padding-bottom: 2rem;
-		overflow: visible;
-		min-width: 0;
-		transition: all 0.5s;
-		cursor: default;
-
-		&:hover {
-			color: theme('colors.gray.600');
-		}
-	}
-
-	:global(.step > .title.expandable) {
-		cursor: pointer;
-	}
-
-	:global(.step .content) {
-		grid-row: 2;
-		height: fit-content;
-	}
-
-	:global(.column) {
-		display: flex;
-		flex-direction: column;
-		gap: 0.5rem;
-		position: relative;
-
-		:global(.cell) {
-			height: var(--vector-height);
-			display: flex;
-			gap: 1rem;
-			align-items: center;
-			position: relative;
-		}
-
-		:global(.subtitle) {
-			position: absolute;
-			top: 0;
-			transform: translateY(calc(-100% - 1rem));
-			text-align: center;
-			font-size: 0.8rem;
-			color: theme('colors.gray.400');
-			width: 100%;
-			z-index: $COLUMN_TITLE_INDEX;
-		}
-	}
-
-	:global(.vector),
-	:global(.sub-vector) {
-		position: relative;
-		z-index: $VECTOR_INDEX;
-		width: 12px;
-		height: var(--vector-height);
-		flex-shrink: 0;
-		justify-content: start;
-	}
-	:global(.cell.x1-12),
-	:global(.vector.x1-12),
-	:global(.sub-vector.x1-12) {
-		height: calc(var(--vector-height) / 12);
-	}
-
-	:global(.cell.x3),
-	:global(.vector.x3),
-	:global(.sub-vector.x3) {
-		height: calc(var(--vector-height) * 3);
-	}
-	:global(.cell.x4),
-	:global(.vector.x4),
-	:global(.sub-vector.x4) {
-		height: calc(var(--vector-height) * 3.1);
-	}
-
-	:global(.vector.vocab),
-	:global(.sub-vector.vocab) {
-		height: 100%;
-		width: 0;
-	}
-
-	:global(.sub-vector.head-rest) {
-		flex: 1 0 0;
-	}
-
-	:global(.label) {
-		font-size: 0.9rem;
-		color: theme('colors.gray.700');
-		z-index: $VECTOR_INDEX;
-		display: inline;
-		max-width: 7rem;
-		overflow: hidden;
-		text-overflow: ellipsis;
-		text-align: right;
-		line-height: var(--vector-height);
-		height: var(--vector-height);
-		flex-shrink: 0;
-	}
-	:global(.label.float) {
-		position: absolute;
-		left: -0.8rem;
-		transform: translateX(-100%);
-	}
-	:global(.label.float-right) {
-		position: absolute;
-		left: -0.8rem;
-	}
-
-	:global(.ellipsis) {
-		white-space: nowrap;
-		overflow: hidden;
-		text-overflow: ellipsis;
-	}
-
-	:global(.bounding) {
-		position: absolute;
-		box-sizing: content-box;
-		top: -0.5rem;
-		padding: 0.5rem 0;
-		left: 0;
-		height: 100%;
-		border: 2px dashed theme('colors.gray.300');
-		border-radius: 0.5rem;
-		transition: opacity 0.5s;
-		opacity: 0;
-		pointer-events: none;
-	}
-	:global(.bounding.active) {
-		opacity: 0.8;
-	}
-
-	:global(.popover) {
-		z-index: $POPOVER_INDEX;
-		width: max-content;
-	}
-
-	:global(.tooltip) {
-		z-index: $TOOLTIP_INDEX;
-		background-color: white !important;
-		color: theme('colors.gray.600') !important;
-		border: 1px solid theme('colors.gray.200') !important;
-		padding: 0.2rem 0.5rem !important;
-		font-size: 0.8rem !important;
-		white-space: nowrap;
-		font-weight: 300 !important;
-		border-color: theme('colors.gray.200') !important;
-	}
-	.dim {
-		position: absolute;
-		top: 0;
-		left: 0;
-		width: 100%;
-		height: 100%;
-		z-index: $DIM_INDEX;
-		background-color: white;
-		opacity: 0.7;
-		user-select: none;
-
-		&.attention {
-			z-index: 0;
-		}
-	}
-	.dim-partial {
-		user-select: none;
-		z-index: $PARTIAL_DIM_INDEX;
-		position: absolute;
-		top: 0;
-		height: 100%;
-
-		&.right {
-			right: 0;
-			background: linear-gradient(90deg, rgba(255, 255, 255, 0) 0%, rgba(255, 255, 255, 1) 80%);
-		}
-		&.left {
-			left: 0;
-			background: linear-gradient(-90deg, rgba(255, 255, 255, 0) 0%, rgba(255, 255, 255, 1) 80%);
-		}
-
-		&.embedding {
-			&.left {
-				display: none;
-			}
-			&.right {
-				width: 60%;
-			}
-		}
-		&.attention {
-			&.left {
-				width: 20%;
-			}
-			&.right {
-				width: 20%;
-			}
-		}
-		&.softmax {
-			&.left {
-				width: 60%;
-			}
-			&.right {
-				display: none;
-			}
-		}
-	}
-	.sankey {
-		position: absolute;
-		left: 0;
-		top: 0;
-		width: 100%;
-		height: 100%;
-
-		&.attention {
-			:global(.sankey-top) {
-				z-index: $EXPANDED_ATTENTION_INDEX !important;
-				pointer-events: none;
-			}
-			// :global(.sankey-top > g) {
-			// 	opacity: 0.3;
-			// }
-			// :global(.sankey-top > g.attention) {
-			// 	opacity: 1;
-			// }
-		}
-	}
-
-	:global(svg g.path-group) {
-		transition: opacity 0.5s;
-	}
-	:global(div.step > div) {
-		transition: opacity 0.5s;
-	}
-	:global(div.step .column) {
-		transition: opacity 0.5s;
-	}
-</style>
