@@ -5,6 +5,7 @@ import {
 	ANYCAST_GATEWAY,
 	buildControlPlaneSteps,
 	buildPacketSteps,
+	compareMembership,
 	flows,
 	hosts,
 	selectHost,
@@ -111,4 +112,97 @@ test('MPLS step preserves the inner transit frame', () => {
 	assert.equal(encapsulated.ethernet.source, before.ethernet.source);
 	assert.equal(encapsulated.ethernet.destination, before.ethernet.destination);
 	assert.equal(encapsulated.mpls.length, 2);
+});
+
+test('resolved transit headers persist through lookup and selection for every flow', () => {
+	for (const flow of flows) {
+		const { steps } = buildPacketSteps(flow);
+		const resolved = steps.find((step) => step.id === 'single-mac').packet;
+		for (const id of ['leaf-decap', 'host-bgp', 'recursive-resolution', 'ecmp']) {
+			assert.deepEqual(steps.find((step) => step.id === id).packet, resolved, id);
+		}
+		const forward = steps.slice(0, -1);
+		assert.ok(forward.every((step) => step.packet.ip.source === resolved.ip.source));
+		assert.ok(forward.every((step) => step.packet.ip.destination === resolved.ip.destination));
+		assert.ok(forward.every((step) => step.packet.transport.ports === resolved.transport.ports));
+		assert.deepEqual(steps.find((step) => step.id === 'ecmp').changes, []);
+		assert.ok(
+			steps.find((step) => step.id === 'fabric-forward').changes.includes('ethernet.destination')
+		);
+	}
+});
+
+test('return traversals and response headers reverse the request direction', () => {
+	for (const flow of flows) {
+		const { steps, selected } = buildPacketSteps(flow);
+		const response = steps.at(-1);
+		assert.equal(response.direction, 'Return');
+		assert.equal(response.outcome, 'Response');
+		assert.deepEqual(
+			response.traversals.map(({ from, to }) => [from, to]),
+			[
+				[selected.id, selected.leaf],
+				[selected.leaf, 'core'],
+				['core', 'border'],
+				['border', 'transit'],
+				['transit', 'client']
+			]
+		);
+		assert.equal(response.packet.ip.source, '203.0.113.42');
+		assert.equal(response.packet.ip.destination, flow.source.split(':')[0]);
+		assert.match(response.observation, /Border → transit/);
+		assert.ok(response.changes.includes('ip.source'));
+	}
+});
+
+test('remote traversal starts leaf to core, then core to owning leaf', () => {
+	const flow = flows.find((flow) => selectIngressLeaf(flow).id !== selectHost(flow).leaf);
+	const { steps, ingress, selected } = buildPacketSteps(flow);
+	assert.deepEqual(
+		steps.find((step) => step.id === 'fabric-forward').traversals.map(({ from, to }) => [from, to]),
+		[
+			[ingress.id, 'core'],
+			['core', selected.leaf]
+		]
+	);
+});
+
+test('all-hosts-down is a converged transit drop, never an in-flight POP packet', () => {
+	const down = hosts.map((host) => host.id);
+	const scenario = buildPacketSteps(flows[0], down);
+	assert.equal(scenario.health.status, 'Unavailable');
+	assert.equal(scenario.health.aggregate, 'withdrawn');
+	assert.equal(scenario.health.eligible.length, 0);
+	assert.ok(scenario.steps.every((step) => step.outcome !== 'In flight'));
+	assert.ok(
+		scenario.steps.flatMap((step) => step.traversals).every((leg) => leg.id === 'client-transit')
+	);
+	assert.equal(scenario.steps[1].outcome, 'Dropped');
+	assert.equal(scenario.steps.at(-1).packet, null);
+	const converged = buildControlPlaneSteps(down).at(-1);
+	assert.match(converged.title, /unavailable/);
+	assert.match(converged.summary, /aggregate is withdrawn/);
+	assert.doesNotMatch(converged.title, /ready/);
+});
+
+test('withdrawal comparison distinguishes pinned, remapped, unavailable, and restored flows', () => {
+	for (const flow of flows) {
+		const winner = selectHost(flow);
+		const unrelated = hosts.find((host) => host.id !== winner.id);
+		const pinned = compareMembership(flow, [], [unrelated.id]);
+		assert.match(pinned.result, /Pinned/);
+		assert.equal(pinned.after.selected.id, winner.id);
+		const remapped = compareMembership(flow, [], [winner.id]);
+		assert.match(remapped.result, /Remapped/);
+		assert.equal(remapped.before.eligible.length, 3);
+		assert.equal(remapped.after.eligible.length, 2);
+		assert.equal(remapped.after.prefix, remapped.before.prefix);
+		assert.equal(remapped.after.mac, remapped.before.mac);
+		assert.equal(remapped.after.aggregate, 'advertised');
+		assert.equal(remapped.after.ingress.id, remapped.before.ingress.id);
+		const down = hosts.map((host) => host.id);
+		assert.match(compareMembership(flow, [], down).result, /Unavailable/);
+		assert.match(compareMembership(flow, down, [unrelated.id]).result, /Restored/);
+		assert.equal(compareMembership(flow, down, []).after.status, 'Ready');
+	}
 });

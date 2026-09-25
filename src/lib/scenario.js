@@ -100,7 +100,7 @@ export const topologyNodes = [
 	{
 		id: 'rr',
 		label: 'Route reflector',
-		sublabel: 'EVPN + service NLRI',
+		sublabel: 'EVPN + IPv4',
 		x: 594,
 		y: 360,
 		kind: 'control'
@@ -152,6 +152,57 @@ export function selectIngressLeaf(flow) {
 	return serviceLeaves[fnv1a(`${flowKey}|transit-gateway`) % serviceLeaves.length];
 }
 
+// Failure experiments are fully converged snapshots, not propagation timelines.
+export function serviceState(unavailableHostIds = []) {
+	const eligible = hosts.filter((host) => !unavailableHostIds.includes(host.id));
+	return {
+		eligible,
+		status:
+			eligible.length === hosts.length ? 'Ready' : eligible.length ? 'Degraded' : 'Unavailable',
+		aggregate: eligible.length ? 'advertised' : 'withdrawn'
+	};
+}
+
+export function membershipSnapshot(flow, unavailableHostIds = []) {
+	return {
+		...serviceState(unavailableHostIds),
+		selected: selectHost(flow, unavailableHostIds),
+		ingress: selectIngressLeaf(flow),
+		prefix: POP_PREFIX,
+		mac: ANYCAST_GATEWAY.mac
+	};
+}
+
+export function compareMembership(flow, beforeIds, afterIds) {
+	const before = membershipSnapshot(flow, beforeIds);
+	const after = membershipSnapshot(flow, afterIds);
+	return {
+		flow: flow.label,
+		before,
+		after,
+		result: !after.selected
+			? 'Unavailable: no eligible host'
+			: before.selected?.id === after.selected.id
+				? `Pinned: ${after.selected.name} still wins`
+				: before.selected
+					? `Remapped: ${before.selected.name} → ${after.selected.name}`
+					: `Restored: ${after.selected.name} serves the flow`
+	};
+}
+
+export function packetChanges(previous, packet) {
+	if (!packet) return [];
+	if (!previous) return ['Initial snapshot'];
+	return ['mpls', 'ethernet', 'ip', 'transport'].flatMap((layer) => {
+		if (layer === 'mpls') {
+			return JSON.stringify(previous.mpls) === JSON.stringify(packet.mpls) ? [] : ['MPLS stack'];
+		}
+		return Object.keys(packet[layer])
+			.filter((field) => previous[layer][field] !== packet[layer][field])
+			.map((field) => `${layer}.${field}`);
+	});
+}
+
 function basePacket(flow) {
 	return {
 		ethernet: { source: 'client gateway', destination: 'next hop unresolved', vlan: 'none' },
@@ -167,6 +218,11 @@ export function buildPacketSteps(flow, unavailableHostIds = []) {
 	const selectedLeaf = serviceLeaves.find((leaf) => leaf.id === selected?.leaf);
 	const remoteSelection = Boolean(selected && ingress.id !== selected.leaf);
 	const packet = basePacket(flow);
+	const resolvedPacket = {
+		...packet,
+		ethernet: { source: '00:aa:00:00:64:50', destination: ANYCAST_GATEWAY.mac, vlan: '120' }
+	};
+	const health = serviceState(unavailableHostIds);
 	const hostRoutes = hosts.map((host) => ({
 		prefix: VIP,
 		path: `${host.asn}`,
@@ -340,7 +396,7 @@ export function buildPacketSteps(flow, unavailableHostIds = []) {
 					.filter((host) => !unavailableHostIds.includes(host.id))
 					.map((host) => `${host.leaf}-${host.id}`)
 			],
-			packet,
+			packet: resolvedPacket,
 			routes: hostRoutes,
 			lookup: selected
 				? [
@@ -366,7 +422,7 @@ export function buildPacketSteps(flow, unavailableHostIds = []) {
 			activeLinks: selected
 				? [`${selected.leaf}-${selected.id}`, `rr-${selected.leaf}`]
 				: ['rr-leaf-a', 'rr-leaf-b'],
-			packet,
+			packet: resolvedPacket,
 			routes: hostRoutes,
 			lookup: selected
 				? [
@@ -388,7 +444,7 @@ export function buildPacketSteps(flow, unavailableHostIds = []) {
 				'BGP supplies the eligible next-hop set. The ASIC hash performs per-flow selection. MPLS is only the transport to the correct leaf.',
 			activeNodes: selected ? [ingress.id, selected.id] : ['leaf-a', 'leaf-b'],
 			activeLinks: [],
-			packet,
+			packet: resolvedPacket,
 			routes: hostRoutes,
 			lookup: selected
 				? [
@@ -468,7 +524,7 @@ export function buildPacketSteps(flow, unavailableHostIds = []) {
 				? `${selected.leafName} emits the host-facing frame`
 				: 'Packet is dropped at the service leaf',
 			summary: selected
-				? `The destination MAC changes from the shared gateway MAC to ${selected.mac}; the destination IP stays 203.0.113.42.`
+				? `The routed frame reaches ${selected.mac} on ${selected.port}; the destination IP is still 203.0.113.42.`
 				: 'No destination MAC can be installed without a live BGP next hop.',
 			detail:
 				'The routing decision occurred once at the ingress leaf. The owning leaf now delivers the resulting Ethernet frame to the selected host.',
@@ -488,8 +544,8 @@ export function buildPacketSteps(flow, unavailableHostIds = []) {
 			lookup: selected
 				? [
 						`Route ${VIP} → ${selected.nextHop}`,
-						`Rewrite DMAC ${selected.mac}`,
-						'Decrement TTL 58 → 57'
+						`DMAC already rewritten to ${selected.mac}`,
+						'TTL remains 57 after the ingress routing decision'
 					]
 				: ['No adjacency', 'Increment drop counter', 'Do not flood unknown service traffic']
 		},
@@ -539,7 +595,7 @@ export function buildPacketSteps(flow, unavailableHostIds = []) {
 				? `${selected.name} sends a response sourced from 203.0.113.42. The leaf routes it back through the POP and transit.`
 				: 'The client times out because the service has no live next hop.',
 			detail:
-				'The return direction can be symmetric through the EVPN service or direct-server-return by policy. This reference path uses routed symmetric return.',
+				'The response is routed through the owning leaf and the same POP transit handoff. A remote-host request need not retrace its original ingress leaf. The headers shown are observed at border egress toward transit, not at every hop in this return overview.',
 			activeNodes: selected
 				? [selected.id, selected.leaf, 'core', 'border', 'transit', 'client']
 				: ['client'],
@@ -574,7 +630,113 @@ export function buildPacketSteps(flow, unavailableHostIds = []) {
 		}
 	];
 
-	return { selected, ingress, steps, hostRoutes };
+	const chapters = [
+		'Arrival',
+		'Arrival',
+		'Arrival',
+		'Transport',
+		'Transport',
+		'Transport',
+		'Transport',
+		'Host selection',
+		'Host selection',
+		'Host selection',
+		'Delivery',
+		'Delivery',
+		'Delivery',
+		'Return'
+	];
+	const observations = [
+		'Client-side IP flow · initial link unresolved',
+		'Transit route lookup · before ARP',
+		'Transit → border · resolved VLAN 120 frame',
+		'Border ingress · original transit frame',
+		'Border → core · inside fabric encapsulation',
+		`Core → ${ingress.name} · after label swap`,
+		`${ingress.name} · after decapsulation`,
+		`${ingress.name} · before service-route lookup`,
+		`${ingress.name} · before adjacency selection`,
+		`${ingress.name} · before routing rewrite`,
+		`${ingress.name} egress · after routing rewrite`,
+		`${selected?.leafName} → ${selected?.name} · host-facing frame`,
+		`${selected?.name} ingress · delivered request`,
+		'Border → transit · response snapshot (not every return hop)'
+	];
+	const enriched = steps.map((step, index) => {
+		const control = step.phase === 'CONTROL → DATA' && step.id !== 'transit-bgp';
+		const traversals = step.activeLinks.map((id) => {
+			const link = topologyLinks.find((candidate) => candidate.id === id);
+			const reverse =
+				step.id === 'return' ||
+				(step.id === 'fabric-forward' && remoteSelection && id === `core-${ingress.id}`) ||
+				(control && link.to.startsWith('cache-'));
+			return {
+				id,
+				from: reverse ? link.to : link.from,
+				to: reverse ? link.from : link.to,
+				kind: control ? 'control' : 'data'
+			};
+		});
+		return {
+			...step,
+			chapter: chapters[index],
+			observation: observations[index],
+			outcome:
+				step.id === 'return' ? 'Response' : step.id === 'host-accept' ? 'Delivered' : 'In flight',
+			direction: step.id === 'return' ? 'Return' : 'Forward',
+			traversals,
+			changes: packetChanges(steps[index - 1]?.packet, step.packet)
+		};
+	});
+	if (!selected) {
+		// The /24 is already withdrawn. Do not animate a new request through the POP.
+		return {
+			selected,
+			ingress,
+			health,
+			hostRoutes,
+			steps: [
+				{
+					...enriched[0],
+					summary: 'The client attempts a request to the VIP, but this POP has no healthy cache.',
+					outcome: 'Attempted'
+				},
+				{
+					...enriched[1],
+					title: 'Transit has no route to this POP',
+					summary: `${POP_PREFIX} is withdrawn. In this reference model, transit drops the request; no alternate POP is modeled.`,
+					detail:
+						'This is a converged snapshot. No withdrawal delay or stale in-flight packet is simulated.',
+					outcome: 'Dropped',
+					observation: 'Transit · discarded before ARP or POP forwarding',
+					routes: [
+						{ prefix: POP_PREFIX, path: '65000', nextHop: ANYCAST_GATEWAY.ip, state: 'withdrawn' }
+					],
+					lookup: [
+						'Aggregate condition: no healthy cache',
+						'No alternate route modeled',
+						'No POP traversal'
+					]
+				},
+				{
+					...enriched[9],
+					title: 'No host is available',
+					chapter: 'Host selection',
+					summary:
+						'The service next-hop set is empty. No packet entered the POP and no response is generated.',
+					detail:
+						'A stale packet reaching a leaf would also fail closed. Restore a cache to advertise the aggregate again.',
+					packet: null,
+					changes: [],
+					traversals: [],
+					outcome: 'No response',
+					observation: 'Service FIB · converged state, no packet snapshot',
+					lookup: ['ECMP width 0', 'Public aggregate withdrawn', 'No response']
+				}
+			]
+		};
+	}
+	return { selected, ingress, health, steps: enriched, hostRoutes };
 }
 
 export const controlPlaneSteps = [
@@ -743,7 +905,7 @@ export function buildControlPlaneSteps(unavailableHostIds = []) {
 		state: unavailable.has(host.id) ? 'withdrawn' : 'active'
 	}));
 
-	return controlPlaneSteps.map((step) => {
+	const steps = controlPlaneSteps.map((step) => {
 		switch (step.id) {
 			case 'host-sessions':
 				return {
@@ -789,6 +951,7 @@ export function buildControlPlaneSteps(unavailableHostIds = []) {
 			case 'aggregate':
 				return {
 					...step,
+					title: activeHosts.length ? step.title : 'Withdraw the POP aggregate from transit',
 					summary: activeHosts.length
 						? `${POP_PREFIX} remains advertised while ${activeHosts.length} cache${activeHosts.length === 1 ? '' : 's'} can serve traffic.`
 						: `${POP_PREFIX} is withdrawn because no cache can serve traffic.`,
@@ -805,6 +968,12 @@ export function buildControlPlaneSteps(unavailableHostIds = []) {
 			case 'steady-state':
 				return {
 					...step,
+					title: activeHosts.length
+						? `The POP is ${serviceState(unavailableHostIds).status.toLowerCase()} for packet forwarding`
+						: 'The POP is unavailable',
+					summary: activeHosts.length
+						? `One advertised public prefix and one transit-facing MAC front ${activeHosts.length} healthy cache${activeHosts.length === 1 ? '' : 's'}.`
+						: 'No eligible host remains. The service FIB is empty and the public aggregate is withdrawn.',
 					activeNodes: topologyNodes
 						.filter((node) => !unavailable.has(node.id))
 						.map((node) => node.id),
@@ -823,6 +992,32 @@ export function buildControlPlaneSteps(unavailableHostIds = []) {
 				return step;
 		}
 	});
+	const chapters = [
+		'Underlay',
+		'Overlay',
+		'Overlay',
+		'Membership',
+		'Membership',
+		'Membership',
+		'Resolution',
+		'External BGP',
+		'Converged'
+	];
+	return steps.map((step, index) => ({
+		...step,
+		chapter: chapters[index],
+		direction: 'Control state',
+		traversals: step.activeLinks.map((id) => {
+			const link = topologyLinks.find((candidate) => candidate.id === id);
+			const reverse = link.to.startsWith('cache-') || id === 'transit-border';
+			return {
+				id,
+				from: reverse ? link.to : link.from,
+				to: reverse ? link.from : link.to,
+				kind: 'control'
+			};
+		})
+	}));
 }
 
 export function hostForFlow(flowId, unavailableHostIds = []) {

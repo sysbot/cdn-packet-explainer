@@ -23,6 +23,7 @@ npm run dev
 ```bash
 npm test
 npm run check
+npm run lint
 npm run build
 ```
 
@@ -39,7 +40,21 @@ This is a reference design, not a claim about one vendor's exact implementation:
 - The leaf ASIC, not MPLS, hashes each flow across the active host set.
 - The border resolves the shared gateway MAC to equal-cost EVPN next hops, then uses inner-flow entropy to select an ingress leaf. If that leaf selects a host attached to the other leaf, an EVPN-MPLS host adjacency carries the already-routed frame across the fabric.
 - Distinct host ASNs require route-reflector Add-Path plus mixed eBGP/iBGP multipath and multipath-relax, or an equivalent route-normalization design, at the leaves. The border imports EVPN routes but not host VIP routes.
-- The illustrated return path is symmetric and routed; direct server return is an alternative design.
+- The illustrated return path is routed through the owning leaf and the same POP transit handoff. Remote-host requests need not retrace their original ingress leaf. The response header snapshot is observed at border egress toward transit.
+
+## Learning workspace
+
+- Step manually through labeled chapters, or use optional 6/10-second demo playback.
+- Read the active traversal, packet observation point, changed fields, and current
+  VIP → next-hop → resolved MAC/leaf/port/label mapping together.
+- Mobile automatically reveals the current hop and a compact path overview.
+- Withdraw or restore hosts to compare membership and per-flow selection. Failure
+  views are converged snapshots: the public aggregate is withdrawn at zero healthy
+  hosts, and the packet walk explains the transit drop instead of forwarding into
+  an unavailable POP. Reset restores the healthy baseline and clears the comparison.
+
+See [implementation notes](IMPLEMENTATION_NOTES.md) for model choices and the
+repeatable browser acceptance checks.
 
 ## License
 
