@@ -6,12 +6,24 @@ import {
 	buildControlPlaneSteps,
 	buildPacketSteps,
 	compareMembership,
+	echoProbes,
 	flows,
+	flowHashKey,
 	hosts,
 	selectHost,
 	selectIngressLeaf,
 	serviceLeaves
 } from '../src/lib/scenario.js';
+import {
+	advanceMaintenance,
+	initialMaintenance,
+	maintenanceFlow,
+	maintenanceIngress,
+	maintenanceState,
+	normalizeQuotedFlow,
+	pmtuQuote,
+	resolveIcmpError
+} from '../src/lib/protocol-cases.js';
 
 test('rendezvous hashing selects one healthy host deterministically', () => {
 	const first = selectHost(flows[0]);
@@ -124,7 +136,10 @@ test('resolved transit headers persist through lookup and selection for every fl
 		const forward = steps.slice(0, -1);
 		assert.ok(forward.every((step) => step.packet.ip.source === resolved.ip.source));
 		assert.ok(forward.every((step) => step.packet.ip.destination === resolved.ip.destination));
-		assert.ok(forward.every((step) => step.packet.transport.ports === resolved.transport.ports));
+		if (flow.protocol === 'ICMP')
+			assert.ok(forward.every((step) => step.packet.icmp.identifier === resolved.icmp.identifier));
+		else
+			assert.ok(forward.every((step) => step.packet.transport.ports === resolved.transport.ports));
 		assert.deepEqual(steps.find((step) => step.id === 'ecmp').changes, []);
 		assert.ok(
 			steps.find((step) => step.id === 'fabric-forward').changes.includes('ethernet.destination')
@@ -205,4 +220,106 @@ test('withdrawal comparison distinguishes pinned, remapped, unavailable, and res
 		assert.match(compareMembership(flow, down, [unrelated.id]).result, /Restored/);
 		assert.equal(compareMembership(flow, down, []).after.status, 'Ready');
 	}
+});
+
+test('ICMP Echo carries type/code/identifier/sequence without fabricated ports', () => {
+	const flow = flows.find((candidate) => candidate.id === 'echo');
+	const scenario = buildPacketSteps(flow);
+	assert.equal(scenario.steps.length, 14);
+	for (const step of scenario.steps) {
+		assert.equal(step.packet.transport, undefined);
+		assert.equal(step.packet.icmp.identifier, flow.icmp.identifier);
+		assert.equal(step.packet.icmp.sequence, flow.icmp.sequence);
+		assert.doesNotMatch(
+			step.summary + step.lookup.join(' '),
+			/five-tuple|addresses \+ ports|undefined|:443/
+		);
+	}
+	assert.deepEqual(scenario.steps[0].packet.icmp, {
+		type: 8,
+		code: 0,
+		identifier: 1001,
+		sequence: 7
+	});
+	assert.deepEqual(scenario.steps.at(-1).packet.icmp, {
+		type: 0,
+		code: 0,
+		identifier: 1001,
+		sequence: 7
+	});
+	assert.ok(scenario.steps.at(-1).changes.includes('icmp.type'));
+	assert.equal(scenario.steps.at(-1).packet.ip.source, '203.0.113.42');
+	assert.equal(scenario.steps.at(-1).packet.ip.destination, flow.source);
+});
+
+test('illustrative ICMP hash uses Echo identifier, not sequence or TCP ports', () => {
+	const flow = flows.find((candidate) => candidate.id === 'echo');
+	const sameIdentifier = { ...flow, icmp: { identifier: flow.icmp.identifier, sequence: 8 } };
+	const otherIdentifier = { ...flow, icmp: echoProbes[1] };
+	assert.equal(flowHashKey(sameIdentifier), flowHashKey(flow));
+	assert.equal(selectHost(sameIdentifier).id, selectHost(flow).id);
+	assert.notEqual(flowHashKey(otherIdentifier), flowHashKey(flow));
+	assert.notEqual(selectHost(otherIdentifier).id, selectHost(flow).id);
+	assert.notEqual(selectHost(flow, [selectHost(flow).id]).id, selectHost(flow).id);
+});
+
+test('quoted ICMP error normalizes response direction to find the original owner', () => {
+	assert.equal(selectHost(maintenanceFlow).id, maintenanceIngress.id);
+	assert.deepEqual(normalizeQuotedFlow(pmtuQuote), {
+		protocol: 'TCP',
+		source: maintenanceFlow.source,
+		destination: maintenanceFlow.destination
+	});
+	const intended = resolveIcmpError(pmtuQuote, 'cache-a');
+	assert.equal(intended.owner.id, 'cache-a');
+	assert.equal(intended.useful, true);
+	assert.equal(resolveIcmpError(pmtuQuote, 'cache-b').useful, false);
+	assert.equal(resolveIcmpError(normalizeQuotedFlow(pmtuQuote), 'cache-a').useful, true);
+	assert.equal(
+		resolveIcmpError({ ...pmtuQuote, destination: '198.51.100.27:53001' }, 'cache-a').owner,
+		null
+	);
+	assert.equal(
+		resolveIcmpError({ ...pmtuQuote, destination: '198.51.100.27:53001' }).useful,
+		false
+	);
+});
+
+test('draining keeps established A-owned TCP while new and subsequent B-owned packets traverse A', () => {
+	let state = advanceMaintenance(initialMaintenance, 'drain');
+	let view = maintenanceState(state);
+	assert.equal(state.phase, 'Draining');
+	assert.equal(view.advertised, true);
+	assert.equal(view.ecmpNextHop.id, 'cache-a');
+	assert.equal(view.localOwner.id, 'cache-a');
+	assert.match(view.newAdmission, /Cache B/);
+	assert.throws(() => advanceMaintenance(state, 'withdraw'), /unresolved dependencies/);
+	state = advanceMaintenance(state, 'new-syn');
+	view = maintenanceState(state);
+	assert.equal(view.forwarder.id, 'cache-a');
+	assert.equal(view.redirectedOwner.id, 'cache-b');
+	assert.deepEqual(new Set(Object.values(view.redirectedPacket)), new Set(['Cache A → Cache B']));
+	state = advanceMaintenance(state, 'finish-local');
+	assert.equal(maintenanceState(state).localOwner, null);
+	state = advanceMaintenance(state, 'forwarding-only');
+	assert.equal(maintenanceState(state).advertised, true);
+	assert.throws(() => advanceMaintenance(state, 'withdraw'), /unresolved dependencies/);
+	assert.throws(() => advanceMaintenance(state, 'assume-steering'), /unresolved dependencies/);
+	state = advanceMaintenance(state, 'finish-forwarded');
+	assert.equal(maintenanceState(state).canWithdraw, false);
+	assert.throws(() => advanceMaintenance(state, 'withdraw'), /unresolved dependencies/);
+	state = advanceMaintenance(state, 'assume-steering');
+	assert.equal(maintenanceState(state).canWithdraw, true);
+	assert.equal(maintenanceState(state).forwarder, null);
+	assert.throws(() => advanceMaintenance(state, 'new-syn'), /unresolved dependencies/);
+	state = advanceMaintenance(state, 'withdraw');
+	assert.equal(state.phase, 'Withdrawn');
+	assert.equal(maintenanceState(state).advertised, false);
+	assert.equal(maintenanceState(state).ecmpNextHop, null);
+	assert.deepEqual(initialMaintenance, {
+		phase: 'Active',
+		localConnection: true,
+		forwardedConnection: false,
+		alternateSteering: false
+	});
 });

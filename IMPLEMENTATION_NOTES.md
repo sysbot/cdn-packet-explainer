@@ -96,3 +96,49 @@ Evidence is attached to the [implementation thread](https://discord.com/channels
 No unresolved design gaps were found within the requested scope. This verification
 covers the deterministic educational model and Chromium at the specified viewports.
 At implementation sign-off, verification was local and publication was a separate step.
+
+## ICMP and TCP handover clarification · 2026-09-25
+
+- ICMP Echo is a fourth profile. The displayed educational ECMP hash includes IPs,
+  protocol, and Echo identifier, but not sequence; hardware hashing varies. The two
+  probe presets select different caches while identifier/sequence match the reply.
+  No port numbers or TCP state appear on the Echo packet.
+- IPv4 fragmentation-needed feedback is a separate example with a quoted TCP
+  response. Normalize the quoted direction to the original connection before
+  finding its recorded owner. Feedback delivered to another cache is not
+  automatically useful. IPv6 Packet Too Big has the same ownership concern, but
+  no IPv6 addresses or implementation are modeled.
+- The maintenance lab has four **conceptual** states: Active → Draining →
+  Forwarding-only → Withdrawn. Cache A remains advertised while its established
+  local TCP connection finishes. A new connection hashes to A and is forwarded
+  to B; its SYN retransmission and later ACK follow the same A-dependent path,
+  and B remains its application owner. A cannot withdraw while either owner or
+  forwarding dependency remains. Even with no active example connections, the
+  lab requires an explicit **assumed** alternate steering prerequisite before
+  withdrawal, because the route was still advertised to A. This button does not
+  demonstrate or verify a real network path.
+- Actual iptables forwarding target, conntrack behavior, symmetric response path,
+  and client-visible VIP preservation are unspecified. In particular the netfilter
+  `REDIRECT` target is local-host-only; remote forwarding may use another method.
+  Neither ECMP rehashing nor the lab migrates TCP/QUIC state. The existing
+  withdrawal switches show converged _new-packet_ route selection after a hard
+  failure, not survival of an established connection.
+
+Verification of this addendum in session `ses_f26a32229ffeIRNzTmSQGEIRHz`:
+
+- PASS `npm test` (19 tests), `npm run check` (0 errors/warnings), `npm run lint`,
+  `npm run build`, and `git diff --check`.
+- PASS built-preview Chromium acceptance at 1440×900 (1,840 assertions),
+  1280×800 (1,840), and 390×844 (580). Includes all 56 packet-step/profile
+  combinations, original failure/control cases, both Echo identifiers,
+  owner-versus-unrelated PMTU delivery, and every maintenance transition.
+- PASS reduced-motion and native Space/Enter checks using the existing local
+  browser harness. Browser console reported no errors. The sampled minimum
+  essential-text contrast remained 7.79:1 with no horizontal overflow.
+- Inspected mobile ICMP reply/error and desktop TCP drain screenshots, attached
+  to the [implementation thread](https://discord.com/channels/718962538599153715/1553078363160313959).
+
+The product detail still requiring real deployment design is **how** alternate
+steering, stateful remote forwarding, return path, and ICMP feedback sharing
+would work. The lab marks these as prerequisites or unknowns, not established
+properties of a live network. No network or firewall settings were modified.

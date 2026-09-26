@@ -52,6 +52,15 @@ This is a reference design, not a claim about one vendor's exact implementation:
   views are converged snapshots: the public aggregate is withdrawn at zero healthy
   hosts, and the packet walk explains the transit drop instead of forwarding into
   an unavailable POP. Reset restores the healthy baseline and clears the comparison.
+- Select ICMP Echo to inspect type/code, identifier, and sequence without fabricated
+  TCP ports. Try two Echo identifiers and observe deterministic illustrative ECMP.
+- Compare a quoted-flow ICMP PMTU error delivered to its original connection owner
+  versus an unrelated cache. Walk through planned TCP drain, host forwarding,
+  dependencies, and conditional withdrawal separately from hard failure.
+
+The maintenance handover is a conceptual educational state machine. Actual
+iptables/remote forwarding rules, reply path, and VIP-preserving behavior are not
+specified; established TCP or QUIC application state is not migrated by ECMP.
 
 See [implementation notes](IMPLEMENTATION_NOTES.md) for model choices and the
 repeatable browser acceptance checks.

@@ -31,7 +31,21 @@ export const flows = [
 		destination: '203.0.113.42:443',
 		protocol: 'UDP',
 		description: 'An HTTP/3 connection over QUIC'
+	},
+	{
+		id: 'echo',
+		label: 'ICMP Echo',
+		source: '198.51.100.56',
+		destination: '203.0.113.42',
+		protocol: 'ICMP',
+		icmp: { identifier: 1001, sequence: 7 },
+		description: 'An ICMP Echo Request to the shared VIP'
 	}
+];
+
+export const echoProbes = [
+	{ identifier: 1001, sequence: 7 },
+	{ identifier: 2002, sequence: 8 }
 ];
 
 export const hosts = [
@@ -135,12 +149,18 @@ function fnv1a(value) {
 	return hash >>> 0;
 }
 
+export function flowHashKey(flow) {
+	return flow.protocol === 'ICMP'
+		? `${flow.protocol}|${flow.source}|${flow.destination}|echo-id:${flow.icmp.identifier}`
+		: `${flow.protocol}|${flow.source}|${flow.destination}`;
+}
+
 export function selectHost(flow, unavailableHostIds = []) {
 	const unavailable = new Set(unavailableHostIds);
 	const candidates = hosts.filter((host) => !unavailable.has(host.id));
 	if (candidates.length === 0) return null;
 
-	const flowKey = `${flow.protocol}|${flow.source}|${flow.destination}`;
+	const flowKey = flowHashKey(flow);
 	return candidates.reduce((winner, host) => {
 		const score = fnv1a(`${flowKey}|${host.id}`);
 		return !winner || score > winner.score ? { host, score } : winner;
@@ -148,7 +168,7 @@ export function selectHost(flow, unavailableHostIds = []) {
 }
 
 export function selectIngressLeaf(flow) {
-	const flowKey = `${flow.protocol}|${flow.source}|${flow.destination}`;
+	const flowKey = flowHashKey(flow);
 	return serviceLeaves[fnv1a(`${flowKey}|transit-gateway`) % serviceLeaves.length];
 }
 
@@ -181,11 +201,11 @@ export function compareMembership(flow, beforeIds, afterIds) {
 		before,
 		after,
 		result: !after.selected
-			? 'Unavailable: no eligible host'
+			? 'Unavailable: no eligible host for new selection'
 			: before.selected?.id === after.selected.id
-				? `Pinned: ${after.selected.name} still wins`
+				? `Pinned: ${after.selected.name} still wins the ECMP selection`
 				: before.selected
-					? `Remapped: ${before.selected.name} → ${after.selected.name}`
+					? `Remapped: ${before.selected.name} → ${after.selected.name} for a new selection (established ownership not inferred)`
 					: `Restored: ${after.selected.name} serves the flow`
 	};
 }
@@ -193,12 +213,13 @@ export function compareMembership(flow, beforeIds, afterIds) {
 export function packetChanges(previous, packet) {
 	if (!packet) return [];
 	if (!previous) return ['Initial snapshot'];
-	return ['mpls', 'ethernet', 'ip', 'transport'].flatMap((layer) => {
+	return ['mpls', 'ethernet', 'ip', 'transport', 'icmp'].flatMap((layer) => {
 		if (layer === 'mpls') {
 			return JSON.stringify(previous.mpls) === JSON.stringify(packet.mpls) ? [] : ['MPLS stack'];
 		}
+		if (!packet[layer]) return [];
 		return Object.keys(packet[layer])
-			.filter((field) => previous[layer][field] !== packet[layer][field])
+			.filter((field) => previous[layer]?.[field] !== packet[layer][field])
 			.map((field) => `${layer}.${field}`);
 	});
 }
@@ -208,7 +229,9 @@ function basePacket(flow) {
 		ethernet: { source: 'client gateway', destination: 'next hop unresolved', vlan: 'none' },
 		mpls: [],
 		ip: { source: flow.source.split(':')[0], destination: '203.0.113.42', ttl: 58 },
-		transport: { protocol: flow.protocol, ports: `${flow.source.split(':')[1]} → 443` }
+		...(flow.protocol === 'ICMP'
+			? { icmp: { type: 8, code: 0, ...flow.icmp } }
+			: { transport: { protocol: flow.protocol, ports: `${flow.source.split(':')[1]} → 443` } })
 	};
 }
 
@@ -237,7 +260,7 @@ export function buildPacketSteps(flow, unavailableHostIds = []) {
 			phase: 'DATA PLANE',
 			layer: 'L3/L4',
 			title: 'Client sends to the CDN VIP',
-			summary: `${flow.description} targets 203.0.113.42:443. The client does not know which POP host will serve it.`,
+			summary: `${flow.description} targets ${flow.destination}. The client does not know which POP host will serve it.`,
 			detail:
 				'DNS or anycast policy has already selected this POP prefix. The packet begins as an ordinary IP flow.',
 			activeNodes: ['client'],
@@ -246,7 +269,7 @@ export function buildPacketSteps(flow, unavailableHostIds = []) {
 			lookup: [
 				'Destination 203.0.113.42',
 				'Protocol ' + flow.protocol,
-				'No server identity in packet'
+				flow.protocol === 'ICMP' ? 'Echo type 8/code 0 · no ports' : 'No server identity in packet'
 			]
 		},
 		{
@@ -438,7 +461,9 @@ export function buildPacketSteps(flow, unavailableHostIds = []) {
 			layer: 'L3 ECMP',
 			title: selected ? `${ingress.name} ECMP selects ${selected.name}` : 'No host is available',
 			summary: selected
-				? `A rendezvous hash of the five-tuple maps this flow to ${selected.name}; only flows owned by a failed host move.`
+				? flow.protocol === 'ICMP'
+					? `This illustrative hash uses source IP, VIP, ICMP protocol, and Echo identifier to choose ${selected.name}. It is deterministic for those inputs, not random per packet.`
+					: `A rendezvous hash of the five-tuple maps this flow to ${selected.name}; only new flow selections owned by a failed host move. Established connection ownership requires separate steering.`
 				: 'The forwarding set is empty, so the switch drops the packet rather than guessing.',
 			detail:
 				'BGP supplies the eligible next-hop set. The ASIC hash performs per-flow selection. MPLS is only the transport to the correct leaf.',
@@ -448,9 +473,13 @@ export function buildPacketSteps(flow, unavailableHostIds = []) {
 			routes: hostRoutes,
 			lookup: selected
 				? [
-						`Hash key ${flow.protocol} + addresses + ports`,
+						flow.protocol === 'ICMP'
+							? 'Illustrative hash: IPs + protocol + Echo identifier (not sequence)'
+							: `Hash key ${flow.protocol} + addresses + ports`,
 						`Winner ${selected.name}`,
-						'Flow remains pinned while membership is stable'
+						flow.protocol === 'ICMP'
+							? 'Different identifiers may pick a different answering cache; hardware varies'
+							: 'A stable ECMP winner alone does not migrate a connection'
 					]
 				: ['ECMP width 0', 'Drop reason: no-service-next-hop', 'Health policy may withdraw /24']
 		},
@@ -557,10 +586,14 @@ export function buildPacketSteps(flow, unavailableHostIds = []) {
 				? `${selected.name} accepts the VIP on loopback`
 				: 'Request never reaches a host',
 			summary: selected
-				? `${selected.name} owns 203.0.113.42/32 as a service loopback and terminates the request.`
+				? flow.protocol === 'ICMP'
+					? `${selected.name} answers this Echo Request for the shared VIP. No other cache's TCP socket state is needed.`
+					: `${selected.name} owns 203.0.113.42/32 as a service loopback and terminates the request.`
 				: 'All host advertisements are withdrawn.',
 			detail:
-				'The same VIP can exist on every cache because the hosts advertise it rather than bridging it together.',
+				flow.protocol === 'ICMP'
+					? 'Echo is independent per request. Another identifier or a changed healthy set can choose a different cache; no TCP socket moves.'
+					: 'The same VIP can exist on every cache because the hosts advertise it rather than bridging it together. QUIC uses UDP but still has connection ownership; UDP transport does not imply session migration.',
 			activeNodes: selected ? [selected.id] : [],
 			activeLinks: [],
 			packet: selected
@@ -578,7 +611,9 @@ export function buildPacketSteps(flow, unavailableHostIds = []) {
 				? [
 						'VIP bound to loopback',
 						'Weak-host/service policy accepts packet',
-						'Application serves object'
+						flow.protocol === 'ICMP'
+							? 'Cache generates Echo Reply; no TCP state needed'
+							: 'Application serves object'
 					]
 				: [
 						'No application selected',
@@ -590,9 +625,15 @@ export function buildPacketSteps(flow, unavailableHostIds = []) {
 			id: 'return',
 			phase: 'DATA PLANE',
 			layer: 'L3 / BGP',
-			title: selected ? 'Return traffic keeps the VIP as source' : 'No return packet is generated',
+			title: selected
+				? flow.protocol === 'ICMP'
+					? 'Echo Reply returns from the VIP'
+					: 'Return traffic keeps the VIP as source'
+				: 'No return packet is generated',
 			summary: selected
-				? `${selected.name} sends a response sourced from 203.0.113.42. The leaf routes it back through the POP and transit.`
+				? flow.protocol === 'ICMP'
+					? `${selected.name} replies from 203.0.113.42 with the same identifier ${flow.icmp.identifier} and sequence ${flow.icmp.sequence}; the sender matches the reply.`
+					: `${selected.name} sends a response sourced from 203.0.113.42. The leaf routes it back through the POP and transit.`
 				: 'The client times out because the service has no live next hop.',
 			detail:
 				'The response is routed through the owning leaf and the same POP transit handoff. A remote-host request need not retrace its original ingress leaf. The headers shown are observed at border egress toward transit, not at every hop in this return overview.',
@@ -617,7 +658,14 @@ export function buildPacketSteps(flow, unavailableHostIds = []) {
 						},
 						mpls: [],
 						ip: { source: '203.0.113.42', destination: flow.source.split(':')[0], ttl: 58 },
-						transport: { protocol: flow.protocol, ports: `443 → ${flow.source.split(':')[1]}` }
+						...(flow.protocol === 'ICMP'
+							? { icmp: { type: 0, code: 0, ...flow.icmp } }
+							: {
+									transport: {
+										protocol: flow.protocol,
+										ports: `443 → ${flow.source.split(':')[1]}`
+									}
+								})
 					}
 				: packet,
 			lookup: selected

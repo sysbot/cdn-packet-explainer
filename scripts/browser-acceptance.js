@@ -63,7 +63,7 @@ window.cdnAcceptance = (async () => {
 	await click(reset);
 	await click('.mode-tabs button:first-child');
 	assert(text('.demo-controls button') === 'Auto Play', 'Manual default');
-	for (const flow of ['video', 'api', 'quic']) {
+	for (const flow of ['video', 'api', 'quic', 'echo']) {
 		await select('.flow-select select', flow);
 		assert(
 			document.querySelector(stepPicker).options.length === 14,
@@ -118,8 +118,106 @@ window.cdnAcceptance = (async () => {
 					'Response IP direction'
 				);
 			}
+			if (flow === 'echo') {
+				assert(
+					!text('.packet-inspector').includes('Source → destination port'),
+					'Echo has no port fields'
+				);
+				assert(
+					text('.header-layer.icmp').includes('Identifier') &&
+						text('.header-layer.icmp').includes('Sequence'),
+					'Echo ICMP fields'
+				);
+				assert(
+					text('.packet-summary').includes(
+						index === 13 ? 'Reply · type 0/code 0' : 'Request · type 8/code 0'
+					),
+					'Correct ICMP type/code'
+				);
+			}
 		}
 	}
+	await select('.flow-select select', 'echo');
+	await select('[aria-label="Echo probe"]', 0);
+	assert(text('.two-decisions').includes('Cache C'), 'Initial Echo identifier selects Cache C');
+	await select('[aria-label="Echo probe"]', 1);
+	assert(text('.two-decisions').includes('Cache A'), 'Another Echo identifier can select Cache A');
+	assert(text('.packet-summary').includes('id 2002 · seq 8'), 'Alternate Echo probe visible');
+	await click(hostButton('Cache A'));
+	assert(
+		!text('.two-decisions').includes('Cache A via VIP-route ECMP'),
+		'Echo remaps after host withdrawal'
+	);
+	await click(reset);
+	await click('[aria-label="Deliver ICMP error to cache"] button:nth-child(2)');
+	assert(
+		text('[aria-label="ICMP error feedback"] .case-result').includes(
+			'does not automatically reach Cache A'
+		),
+		'Unrelated cache cannot consume PMTU feedback'
+	);
+	assert(
+		text('[aria-label="ICMP error feedback"]').includes('53000') &&
+			text('[aria-label="ICMP error feedback"]').includes('Normalized original connection'),
+		'Quoted response direction normalized'
+	);
+	await click('[aria-label="Deliver ICMP error to cache"] button:first-child');
+	assert(
+		text('[aria-label="ICMP error feedback"] .case-result').includes('intended owner'),
+		'Original owner receives feedback'
+	);
+	const maintenance = '[aria-label="TCP maintenance handover"]';
+	const action = (index) => `${maintenance} .maintenance-actions button:nth-child(${index})`;
+	await click(action(8));
+	assert(
+		text(maintenance).includes('Active') && text(maintenance).includes('Old: Cache A'),
+		'Active A-owned connection'
+	);
+	await click(action(1));
+	assert(
+		text(maintenance).includes('Draining') &&
+			text(maintenance).includes('Advertised · still reachable'),
+		'Drain retains route'
+	);
+	assert(document.querySelector(action(7)).disabled, 'Cannot withdraw A during drain');
+	await click(action(2));
+	assert(
+		text(maintenance).includes('New: Cache B') &&
+			text(maintenance).includes('later ACK: Cache A → Cache B'),
+		'New SYN and subsequent ACK stay B-owned via A'
+	);
+	assert(
+		document.querySelector(action(6)).disabled,
+		'Cannot assume A removal while B-owned connection depends on A'
+	);
+	await click(action(3));
+	await click(action(4));
+	assert(
+		document.querySelector(action(7)).disabled,
+		'Forwarding-only A cannot be withdrawn with B dependency'
+	);
+	await click(action(5));
+	assert(document.querySelector(action(7)).disabled, 'Alternate steering still required');
+	await click(action(6));
+	assert(
+		text(maintenance).includes('mechanism unspecified'),
+		'Alternate steering explicitly conceptual'
+	);
+	assert(
+		!document.querySelector(action(7)).disabled,
+		'Withdrawal only enabled after all prerequisites'
+	);
+	await click(action(7));
+	assert(
+		text(maintenance).includes('Withdrawn') &&
+			text(maintenance).includes('Cache A removed from set'),
+		'Withdrawal removes A next hop'
+	);
+	await click(action(8));
+	assert(
+		text(maintenance).includes('Active') && document.querySelector(action(7)).disabled,
+		'Maintenance reset returns active state'
+	);
 
 	await click('.mode-tabs button:nth-child(2)');
 	for (let index = 0; index < 9; index += 1) {
@@ -220,8 +318,9 @@ window.cdnAcceptance = (async () => {
 		viewport: `${innerWidth}x${innerHeight}`,
 		assertions,
 		minEssentialContrast: Number(minContrast.toFixed(2)),
-		packetSteps: 42,
+		packetSteps: 56,
 		controlSteps: 9,
-		failures: 'pinned/remapped/empty/restored/reset'
+		failures: 'pinned/remapped/empty/restored/reset',
+		protocolCases: 'ICMP Echo/error ownership and TCP maintenance dependencies'
 	};
 })();

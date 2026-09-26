@@ -7,7 +7,11 @@
 		'ip.source': 'source IP',
 		'ip.destination': 'destination IP',
 		'ip.ttl': 'IP TTL',
-		'transport.ports': 'ports'
+		'transport.ports': 'ports',
+		'icmp.type': 'ICMP type',
+		'icmp.code': 'ICMP code',
+		'icmp.identifier': 'Echo identifier',
+		'icmp.sequence': 'Echo sequence'
 	};
 	$: packet = step.packet;
 	$: layers = packet
@@ -42,17 +46,32 @@
 						{ name: 'TTL', value: packet.ip.ttl, key: 'ip.ttl' }
 					]
 				},
-				{
-					name: packet.transport.protocol,
-					kind: 'transport',
-					fields: [
-						{
-							name: 'Source → destination port',
-							value: packet.transport.ports,
-							key: 'transport.ports'
-						}
-					]
-				}
+				...(packet.icmp
+					? [
+							{
+								name: 'ICMP Echo',
+								kind: 'icmp',
+								fields: [
+									{ name: 'Type', value: packet.icmp.type, key: 'icmp.type' },
+									{ name: 'Code', value: packet.icmp.code, key: 'icmp.code' },
+									{ name: 'Identifier', value: packet.icmp.identifier, key: 'icmp.identifier' },
+									{ name: 'Sequence', value: packet.icmp.sequence, key: 'icmp.sequence' }
+								]
+							}
+						]
+					: [
+							{
+								name: packet.transport.protocol,
+								kind: 'transport',
+								fields: [
+									{
+										name: 'Source → destination port',
+										value: packet.transport.ports,
+										key: 'transport.ports'
+									}
+								]
+							}
+						])
 			]
 		: [];
 </script>
@@ -67,13 +86,21 @@
 	<p class="observation">{step.observation}</p>
 	{#if packet}
 		<div class="packet-summary" aria-label="Packet summary">
-			<span>{packet.transport.protocol} · {packet.transport.ports}</span>
+			<span
+				>{packet.icmp
+					? `ICMP Echo ${packet.icmp.type === 8 ? 'Request · type 8/code 0' : 'Reply · type 0/code 0'} · id ${packet.icmp.identifier} · seq ${packet.icmp.sequence}`
+					: `${packet.transport.protocol} · ${packet.transport.ports}`}</span
+			>
 			<strong>{packet.ip.source} → {packet.ip.destination}</strong>
 		</div>
 		<p class="invariant">
 			{step.direction === 'Return'
-				? 'Response: IP addresses and ports reverse. This snapshot is at the transit handoff.'
-				: 'Forward invariant: source IP, destination VIP, and transport tuple stay unchanged.'}
+				? packet.icmp
+					? 'Echo Reply: IP addresses reverse; identifier and sequence match the request. Snapshot at transit handoff.'
+					: 'Response: IP addresses and ports reverse. This snapshot is at the transit handoff.'
+				: packet.icmp
+					? 'Forward invariant: source IP, destination VIP, and Echo identifier/sequence stay unchanged. ICMP has no ports.'
+					: 'Forward invariant: source IP, destination VIP, and transport tuple stay unchanged.'}
 		</p>
 		<p class="change-note">
 			<strong>Changed vs previous step:</strong>

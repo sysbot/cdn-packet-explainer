@@ -7,15 +7,18 @@
 		buildControlPlaneSteps,
 		buildPacketSteps,
 		compareMembership,
+		echoProbes,
 		flows,
 		hosts
 	} from '$lib/scenario.js';
 	import Topology from '$lib/Topology.svelte';
 	import PacketInspector from '$lib/PacketInspector.svelte';
+	import ProtocolCases from '$lib/ProtocolCases.svelte';
 
 	let mode = 'packet';
 	let stepIndex = 0;
 	let flowId = flows[0].id;
+	let echoProbe = 0;
 	let unavailableHostIds = [];
 	let comparison = null;
 	let playing = false;
@@ -23,7 +26,9 @@
 	let pace = 6000;
 	let workspace;
 
-	$: flow = flows.find((candidate) => candidate.id === flowId) || flows[0];
+	$: selectedFlow = flows.find((candidate) => candidate.id === flowId) || flows[0];
+	$: flow =
+		selectedFlow.id === 'echo' ? { ...selectedFlow, icmp: echoProbes[echoProbe] } : selectedFlow;
 	$: scenario = buildPacketSteps(flow, unavailableHostIds);
 	$: health = scenario.health;
 	$: steps = mode === 'packet' ? scenario.steps : buildControlPlaneSteps(unavailableHostIds);
@@ -160,6 +165,16 @@
 					>{/each}</select
 			></label
 		>
+		{#if flowId === 'echo'}
+			<label class="flow-select echo-select"
+				>Echo probe
+				<select aria-label="Echo probe" bind:value={echoProbe} on:change={changeFlow}>
+					{#each echoProbes as probe, index}<option value={index}
+							>ID {probe.identifier} · seq {probe.sequence}</option
+						>{/each}
+				</select>
+			</label>
+		{/if}
 		<span class="snapshot-label">Converged snapshot · manual by default</span>
 	</section>
 
@@ -230,14 +245,14 @@
 				<p>
 					<b>{scenario.selected ? '2 · Ingress chooses host' : '2 · No host next hop'}</b><span
 						>{scenario.selected
-							? `${scenario.selected.name} via VIP-route ECMP.`
+							? `${scenario.selected.name} via VIP-route ECMP${flow.protocol === 'ICMP' ? ' (Echo ID)' : ''}.`
 							: 'Empty next-hop set; service unavailable.'}</span
 					>
 				</p>
 			</div>
 			<p class="caption">
 				{scenario.selected
-					? 'Selection preview for this flow. MPLS transports the choice; it never chooses the host.'
+					? 'Selection preview for this request. MPLS transports the choice; it never chooses the host or migrates a connection.'
 					: 'The withdrawn aggregate prevents a new POP traversal. No alternate POP or propagation delay is simulated.'}
 			</p>
 		</div>
@@ -285,7 +300,7 @@
 		</div>
 		<p class="caption">
 			From {scenario.ingress.name}: host next-hop IP → MAC + owner leaf + port + optional remote
-			service label. Selection preview for {flow.label}.
+			service label. Selection preview for {flow.label}; established TCP/QUIC ownership is separate.
 		</p>
 		<div class="adjacency-grid">
 			{#each hosts as host}
@@ -394,15 +409,17 @@
 					{comparison.after.aggregate === comparison.before.aggregate
 						? 'External prefix advertisement and transit MAC unchanged.'
 						: `Aggregate ${comparison.before.aggregate} → ${comparison.after.aggregate}; transit MAC identity unchanged.`}
-					Ingress hash is independent of host membership. Restoring a higher-ranked host can reclaim its
-					flows.
+					Ingress hash is independent of host membership. Restoring a higher-ranked host can reclaim new
+					selections; established TCP/QUIC owners require separate steering.
 				</p>
 			</div>
 		{:else}<p class="caption">
-				Try withdrawing an unrelated host: this flow stays pinned. Withdraw the selected host: only
-				affected flows remap.
+				Try withdrawing an unrelated host: this selection stays pinned. Withdraw the selected host:
+				new ECMP choices can remap. Existing TCP/QUIC connections need ownership-aware steering; a
+				changed hash does not migrate their state.
 			</p>{/if}
 	</section>
+	<ProtocolCases />
 	<p class="keyboard-hint">
 		Keyboard: ← / → step · Space play / pause. Buttons and selects keep native keyboard behavior.
 	</p>
